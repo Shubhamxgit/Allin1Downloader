@@ -1,37 +1,33 @@
-# Python cache files
+# Python cache
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
+*.pyd
 
-# Virtual environment
-venv/
+# Virtual environments
 env/
+venv/
+ENV/
 .venv/
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE configs
+# IDE settings
 .vscode/
 .idea/
 
-# Logs
-*.log
+# OS junk
+.DS_Store
+Thumbs.db
 
-# Build/Dist output
+# PyInstaller build folders
 build/
 dist/
 *.spec
 
-# Secrets
-.env
-*.pem
-*.p12
-
-# large binaries (if you use them)
+# Executables
 *.exe
-*.msi
 
-# Git LFS placeholder (if used)
-*.iso
+# Logs
+*.log
+
+# Patch files
+*.patch
