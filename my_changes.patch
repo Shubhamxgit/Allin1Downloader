@@ -1,9 +1,492 @@
-diff --git a/app.py b/app.py
-index 001f5cb..e9a3ef3 100644
---- a/app.py
-+++ b/app.py
-@@ -1,3 +1,4 @@
-+# test change for patch
- #!/usr/bin/env python3
- # multi_downloader_polished.py
- """
+*** a/multi_downloader_polished.py
+--- b/multi_downloader_polished.py
+@@
+ from PyQt5 import QtCore, QtGui, QtWidgets
+-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
++from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QCoreApplication
+ from PyQt5.QtGui import QIcon, QPixmap
+ from PyQt5.QtWidgets import (
+     QApplication, QWidget, QLabel, QPushButton, QLineEdit, QTextEdit,
+     QVBoxLayout, QHBoxLayout, QFileDialog, QProgressBar, QMessageBox,
+     QCheckBox, QComboBox, QSpinBox, QSystemTrayIcon, QMenu, QAction, QStyle
+ )
++from PyQt5.QtNetwork import QLocalServer, QLocalSocket
+@@
+ DEFAULT_DOWNLOAD_DIR = Path("C:/Downloads")
+ DEFAULT_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+@@
+ def thumbnail_pixmap_from_url(url, max_w=320):
+     try:
+-        r = requests.get(url, timeout=12)
++        # Lightweight fetch; user-agent avoids some 403s
++        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (Downloader GUI)"})
+         r.raise_for_status()
+         im = Image.open(BytesIO(r.content))
+         im.thumbnail((max_w, max_w*2))
+         buf = BytesIO()
+         im.save(buf, format="PNG")
+@@
+ class YTDLPWorker(QThread):
+@@
+     def run(self):
+         # lazy import
+         try:
+             import yt_dlp
+         except Exception as e:
+             self.finished.emit({"ok": False, "error": f"yt-dlp import error: {e}"})
+             return
++        # Ensure output directory exists
++        try:
++            Path(self.outdir).mkdir(parents=True, exist_ok=True)
++        except Exception as e:
++            self.finished.emit({"ok": False, "error": f"Cannot create output dir: {e}"})
++            return
+@@
+         for attempt in range(1, self.retries+1):
+             try:
+                 self.status.emit(f"Starting download (attempt {attempt})")
+                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                     ydl.download([self.url])
+                 self.finished.emit({"ok": True, "url": self.url})
+                 return
+             except Exception as e:
+                 last_err = e
+                 self.status.emit(f"Error: {e} (retrying {attempt}/{self.retries})")
+                 # exponential backoff
+                 time.sleep(min(10, 1.5 ** attempt))
+         self.finished.emit({"ok": False, "url": self.url, "error": str(last_err)})
+@@
+ class GalleryDLWorker(QThread):
+@@
+     def run(self):
+         try:
+-            cmd = ["gallery-dl", "-d", self.outdir, self.url]
++            Path(self.outdir).mkdir(parents=True, exist_ok=True)
++            cmd = ["gallery-dl", "-d", self.outdir, self.url]
+             if self.cookies:
+-                cmd.extend(["--cookies", self.cookies])
++                cmd.extend(["--cookies", self.cookies])
+             self.status.emit("Running gallery-dl...")
+             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+             if proc.returncode == 0:
+                 self.finished.emit({"ok": True, "out": proc.stdout.strip() or "gallery-dl succeeded"})
+             else:
+                 msg = (proc.stderr or proc.stdout or f"gallery-dl exit {proc.returncode}").strip()
+                 self.finished.emit({"ok": False, "out": msg})
+@@
+ class MultiDownloader(QWidget):
+     def __init__(self):
+         super().__init__()
+         self.cfg = load_config()
+         self.download_dir = Path(self.cfg.get("download_dir", str(DEFAULT_DOWNLOAD_DIR)))
+         self.cookies = self.cfg.get("cookies", "")
+         self.proxy = self.cfg.get("proxy", "")
+         self.dark_mode = self.cfg.get("dark_mode", False)
+         self.clip_enabled = False
+         self.clip_last = ""
+         self.startup_enabled = self.cfg.get("startup", False)
+@@
+         self._setup_tray()
+         if self.dark_mode:
+             self.apply_dark_theme(True)
+@@
+         self.clip_timer = QTimer(self)
+         self.clip_timer.setInterval(2000)
+         self.clip_timer.timeout.connect(self._check_clipboard)
++
++        # make sure folder exists early
++        try:
++            self.download_dir.mkdir(parents=True, exist_ok=True)
++        except Exception as e:
++            QMessageBox.warning(self, "Download folder", f"Cannot access download folder:\n{e}")
+@@
+     def _build_ui(self):
+         self.setWindowTitle("Multi Social Media Downloader")
+         self.resize(980, 640)
+         main = QVBoxLayout(self)
+@@
+-        cookies_row = QHBoxLayout()
++        cookies_row = QHBoxLayout()
+         cookies_row.addWidget(QLabel("Cookies (optional):"))
+         self.cookies_edit = QLineEdit(self.cookies or "")
+         cookies_row.addWidget(self.cookies_edit)
+         self.browse_cookies = QPushButton("Browse")
+         cookies_row.addWidget(self.browse_cookies)
+         left_col.addLayout(cookies_row)
++
++        proxy_row = QHBoxLayout()
++        proxy_row.addWidget(QLabel("Proxy (optional):"))
++        self.proxy_edit = QLineEdit(self.proxy or "")
++        proxy_row.addWidget(self.proxy_edit)
++        left_col.addLayout(proxy_row)
+@@
+         self.thumb_label = QLabel("Thumbnail")
+         self.thumb_label.setFixedSize(360, 200)
+         self.thumb_label.setStyleSheet("border:1px solid #888; background:#111;")
+         self.thumb_label.setAlignment(Qt.AlignCenter)
+         right_col.addWidget(self.thumb_label)
+@@
+         self.save_settings_btn.clicked.connect(self.on_save_settings)
+         self.dark_toggle.stateChanged.connect(self.on_toggle_dark)
+         self.clip_toggle.stateChanged.connect(self.on_toggle_clip)
+         self.startup_toggle.stateChanged.connect(self.on_toggle_startup)
+@@
+     def _setup_tray(self):
+-        icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
+-        self.tray = QSystemTrayIcon(icon, self)
++        if not QSystemTrayIcon.isSystemTrayAvailable():
++            self.tray = None
++            return
++        icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
++        self.tray = QSystemTrayIcon(icon, self)
+         menu = QMenu()
+@@
+-        self.tray.setContextMenu(menu)
+-        self.tray.activated.connect(self._on_tray_activated)
+-        self.tray.show()
++        self.tray.setContextMenu(menu)
++        self.tray.activated.connect(self._on_tray_activated)
++        self.tray.show()
+@@
+     def exit_app(self):
+         try:
+-            self.tray.hide()
++            if self.tray:
++                self.tray.hide()
+         except Exception:
+             pass
+-        QApplication.quit()
++        # stop timers/threads gracefully
++        try:
++            self.item_progress_timer.stop()
++            self.clip_timer.stop()
++            if self.current_worker and self.current_worker.isRunning():
++                self.current_worker.requestInterruption()
++                self.current_worker.wait(3000)
++            if self.gallery_worker and self.gallery_worker.isRunning():
++                self.gallery_worker.requestInterruption()
++                self.gallery_worker.wait(3000)
++        except Exception:
++            pass
++        QApplication.quit()
++
++    def closeEvent(self, event):
++        # Ensure graceful shutdown
++        self.exit_app()
++        event.accept()
+@@
+     def on_save_settings(self):
+         self.cfg["download_dir"] = str(self.download_dir)
+         self.cfg["cookies"] = self.cookies_edit.text().strip()
+-        self.cfg["proxy"] = self.proxy
++        self.cfg["proxy"] = self.proxy_edit.text().strip()
+         self.cfg["dark_mode"] = bool(self.dark_toggle.isChecked())
+         self.cfg["startup"] = bool(self.startup_toggle.isChecked())
+         save_config(self.cfg)
+         QMessageBox.information(self, "Saved", "Settings saved.")
+@@
+     def _set_startup(self, enable: bool):
+         if winreg is None:
+             return False, "winreg not available on this platform"
+         try:
+             exe = sys.executable if getattr(sys, "frozen", False) else sys.argv[0]
+             exe = str(Path(exe).resolve())
+             name = "MultiDownloader"
+             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS) as key:
+                 if enable:
+-                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, exe)
++                    # Quote path to survive spaces
++                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, f"\"{exe}\"")
+                 else:
+                     try:
+                         winreg.DeleteValue(key, name)
+                     except FileNotFoundError:
+                         pass
+             return True, "ok"
+@@
+     def _check_clipboard(self):
+         try:
+             cb = QApplication.clipboard()
+             txt = cb.text().strip()
+-            if txt and txt != self.clip_last:
+-                low = txt.lower()
+-                if any(d in low for d in SUPPORTED_DOMAINS) and ("\n" not in txt):
++            if txt and txt != self.clip_last and ("\n" not in txt):
++                parsed = urlparse(txt)
++                host = (parsed.netloc or "").lower()
++                if parsed.scheme in ("http", "https") and any(d in host for d in SUPPORTED_DOMAINS):
+                     self.clip_last = txt
+                     resp = QMessageBox.question(self, "Clipboard URL detected",
+                                                 f"Detected URL in clipboard:\n{txt}\n\nDownload now (Best)?",
+                                                 QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+                     if resp == QMessageBox.Yes:
+@@
+-                else:
+-                    self.clip_last = txt
++                else:
++                    # don't poison clip_last with non-URL text
++                    pass
+         except Exception:
+             pass
+@@
+     def _fetch_and_show(self, url):
+         self.log("Fetching info for", url)
+         self.status_label.setText("Fetching info...")
+         QApplication.processEvents()
+         try:
+             import yt_dlp
+         except Exception:
+             QMessageBox.warning(self, "Missing", "yt-dlp not installed. Install: pip install yt-dlp")
+             return
+         opts = {"quiet": True, "no_warnings": True}
+         cookies = self.cookies_edit.text().strip()
+         if cookies:
+             opts["cookiefile"] = cookies
+         try:
+             with yt_dlp.YoutubeDL(opts) as ydl:
+-                info = ydl.extract_info(url, download=False)
+-            title = info.get("title") or info.get("id") or url
+-            uploader = info.get("uploader") or info.get("channel") or ""
+-            duration = seconds_to_hhmmss(info.get("duration") or 0)
++                info = ydl.extract_info(url, download=False)
++            # Handle playlists: preview first entry but keep URL as-is for download
++            if info.get("entries") and isinstance(info["entries"], list) and info["entries"]:
++                first = info["entries"][0]
++                title = first.get("title") or first.get("id") or url
++                uploader = first.get("uploader") or first.get("channel") or ""
++                duration = seconds_to_hhmmss(first.get("duration") or 0)
++                self.meta_label.setText(f"<b>{title}</b>\n{uploader}\nDuration: {duration} • Playlist items: {len(info['entries'])}")
++                thumb = first.get("thumbnail")
++                formats = first.get("formats", []) or []
++            else:
++                title = info.get("title") or info.get("id") or url
++                uploader = info.get("uploader") or info.get("channel") or ""
++                duration = seconds_to_hhmmss(info.get("duration") or 0)
++                self.meta_label.setText(f"<b>{title}</b>\n{uploader}\nDuration: {duration}")
++                thumb = info.get("thumbnail")
++                formats = info.get("formats", []) or []
+-            self.meta_label.setText(f"<b>{title}</b>\n{uploader}\nDuration: {duration}")
+-            thumb = info.get("thumbnail")
+-            if thumb:
+-                pix = thumbnail_pixmap_from_url(thumb, max_w=360)
+-                if pix:
+-                    self.thumb_label.setPixmap(pix.scaled(self.thumb_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+-            # populate formats
+-            formats = info.get("formats", []) or []
++            # async thumbnail fetch
++            if thumb:
++                self._load_thumb_async(thumb)
++            # populate formats
+             friendly = []
+             seen = set()
+             for f in formats:
+                 key = (f.get("height"), f.get("abr"), f.get("ext"))
+                 if key in seen:
+                     continue
+                 seen.add(key)
+                 size = f.get("filesize") or f.get("filesize_approx") or 0
+                 if f.get("vcodec") and f.get("vcodec") != "none":
+                     label = f"{f.get('height') or ''}p [{f.get('ext')}] ({friendly_size(size)})"
+                 elif f.get("acodec") and (not f.get("vcodec") or f.get("vcodec") == "none"):
+                     label = f"audio {f.get('abr') or ''}kbps [{f.get('ext')}] ({friendly_size(size)})"
+                 else:
+                     label = f.get("format_note") or f.get("format") or f.get("ext")
+                 friendly.append((label, f.get("format_id")))
+             self.format_combo.clear()
+             for lbl, fid in friendly:
+                 self.format_combo.addItem(lbl, fid)
+             self.format_combo.setEnabled(len(friendly) > 0)
+             self.best_checkbox.setEnabled(True)
+             self.status_label.setText("Info fetched.")
+             self.log("Formats fetched:", len(friendly))
+         except Exception as e:
+@@
+     def on_choose_and_download(self):
+@@
+-        s = self.start_time_edit.text().strip()
+-        e = self.end_time_edit.text().strip()
+-        sections = None
+-        if s and e and s != e:
+-            sections = [{"start_time": s, "end_time": e}]
++        s = self.start_time_edit.text().strip()
++        e = self.end_time_edit.text().strip()
++        sections = self._validated_sections(s, e)
+         self._start_batch([url], use_best=use_best, format_id=fid, sections=sections)
+@@
+     def _process_next_in_queue(self, use_best, format_id, sections):
+         if not self.queue:
+             self.log("Batch complete.")
+             self.status_label.setText("All done.")
+             return
+         url = self.queue.pop(0)
+         self.log("Processing:", url)
+         # detect content type with yt-dlp info; lazy import
+         try:
+             import yt_dlp
+         except Exception:
+             QMessageBox.warning(self, "Missing", "yt-dlp not installed.")
+             return
+         opts = {"quiet": True, "no_warnings": True}
+         cookies = self.cookies_edit.text().strip()
+         if cookies:
+             opts["cookiefile"] = cookies
+         try:
+             with yt_dlp.YoutubeDL(opts) as ydl:
+                 info = ydl.extract_info(url, download=False)
+-            formats = info.get("formats") or []
++            target = info["entries"][0] if info.get("entries") else info
++            formats = target.get("formats") or []
+             has_video = any((f.get("vcodec") and f.get("vcodec") != "none") for f in formats)
+             has_audio = any((f.get("acodec") and f.get("acodec") != "none") for f in formats)
+             if has_video or has_audio:
+                 # start yt-dlp worker
+                 self._start_worker(url, use_best=use_best, format_id=format_id, sections=sections)
+             else:
+                 # image/gallery -> gallery-dl
+                 self.log("Image/gallery detected — using gallery-dl")
+                 self._start_gallery(url)
+         except Exception as e:
+@@
+     def _on_item_progress(self, pct, info):
+         # update target percent and show info (speed)
+         try:
+-            self.item_target_pct = float(pct)
++            self.item_target_pct = max(0.0, min(100.0, float(pct)))
+         except Exception:
+             self.item_target_pct = 0.0
+         if info:
+             self.status_label.setText(f"{pct:.1f}% {info}")
+         self.log(f"Progress: {pct:.1f}% {info}")
+@@
+     def _animate_item_progress(self):
+         # interpolate displayed percent toward target for smooth animation
+         try:
+             diff = self.item_target_pct - self.item_display_pct
+             step = max(0.5, abs(diff) * 0.2)
+             if abs(diff) < 0.01:
+                 self.item_display_pct = self.item_target_pct
+             else:
+-                self.item_display_pct += step if diff > 0 else -step
+-            self.item_progress.setValue(int(self.item_display_pct))
++                self.item_display_pct += step if diff > 0 else -step
++            self.item_display_pct = max(0.0, min(100.0, self.item_display_pct))
++            self.item_progress.setValue(int(self.item_display_pct))
+         except Exception:
+             pass
+@@
+     def _on_worker_finished(self, res):
+         if res.get("ok"):
+             self.log("Downloaded:", res.get("url"))
+-            QMessageBox.information(self, "Downloaded", f"Saved: {res.get('url')}")
++            # Avoid modal spam during batches; tray balloon if available
++            if self.tray:
++                self.tray.showMessage("Download complete", res.get("url") or "", QSystemTrayIcon.Information, 3000)
+         else:
+             err = res.get("error") or ""
+             self.log("Worker failed:", err)
+@@
+         self.batch_done += 1
+         self._update_overall_progress()
+         QtCore.QTimer.singleShot(200, lambda: self._process_next_in_queue(self.best_checkbox.isChecked(), self.format_combo.currentData(), None))
+@@
+     def _update_overall_progress(self):
+         try:
+             if self.batch_total <= 0:
+                 self.overall_progress.setValue(0)
+                 return
+             pct = int((self.batch_done / self.batch_total) * 100)
+-            self.overall_progress.setValue(pct)
++            self.overall_progress.setValue(max(0, min(100, pct)))
+             self.log(f"Batch {self.batch_done}/{self.batch_total}")
+         except Exception:
+             pass
+@@
+     def _run_gallery_dl(self, url):
+         # Synchronous helper (used for simple calls)
+         try:
+             cmd = ["gallery-dl", "-d", str(self.download_dir), url]
+             cookies = self.cookies_edit.text().strip()
+             if cookies:
+                 cmd.extend(["--cookies", cookies])
+             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+             if proc.returncode == 0:
+                 return True, proc.stdout.strip() or "gallery-dl finished"
+             else:
+                 return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+         except FileNotFoundError:
+             return False, "gallery-dl not found"
+         except subprocess.TimeoutExpired:
+             return False, "gallery-dl timeout"
+         except Exception as e:
+             return False, f"gallery-dl error: {e}"
++
++    # ---------- Helpers ----------
++    def _validated_sections(self, start_s: str, end_s: str):
++        def _to_seconds(s: str):
++            if not s or s == "00:00:00":
++                return 0
++            parts = s.split(":")
++            if len(parts) == 2:  # MM:SS
++                m, sec = parts
++                h = 0
++            elif len(parts) == 3:
++                h, m, sec = parts
++            else:
++                return None
++            try:
++                h = int(h); m = int(m); sec = int(sec)
++                if h < 0 or m < 0 or sec < 0:
++                    return None
++                return h*3600 + m*60 + sec
++            except Exception:
++                return None
++        s = _to_seconds(start_s)
++        e = _to_seconds(end_s)
++        if s is None or e is None or e <= s:
++            return None
++        # yt-dlp supports hh:mm:ss strings directly
++        return [{"start_time": start_s, "end_time": end_s}]
++
++    def _load_thumb_async(self, url):
++        class ThumbWorker(QThread):
++            done = pyqtSignal(QPixmap)
++            def __init__(self, u, w):
++                super().__init__(w)
++                self.u = u
++            def run(self):
++                pix = thumbnail_pixmap_from_url(self.u, max_w=360)
++                if pix:
++                    self.done.emit(pix)
++        self._thumb_worker = ThumbWorker(url, self)
++        self._thumb_worker.done.connect(lambda p: self.thumb_label.setPixmap(p.scaled(self.thumb_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)))
++        self._thumb_worker.start()
+@@
+ def main():
+-    app = QApplication(sys.argv)
+-    # single instance guard (basic)
+-    if QtWidgets.QApplication.instance() is not None:
+-        pass
+-    win = MultiDownloader()
+-    win.show()
+-    sys.exit(app.exec_())
++    app = QApplication(sys.argv)
++    # Robust single-instance using QLocalServer
++    key = "multi-social-media-downloader-singleton"
++    socket = QLocalSocket()
++    socket.connectToServer(key)
++    if socket.waitForConnected(100):
++        # Another instance is running
++        QMessageBox.information(None, "Already running", "The downloader is already running.")
++        sys.exit(0)
++    server = QLocalServer()
++    try:
++        server.listen(key)
++    except Exception:
++        # Stale socket on crash; remove and retry
++        QLocalServer.removeServer(key)
++        server.listen(key)
++    win = MultiDownloader()
++    win.show()
++    rc = app.exec_()
++    server.close()
++    sys.exit(rc)
