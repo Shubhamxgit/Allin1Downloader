@@ -1,0 +1,11 @@
+yt-dlp>=2025.8.11
+requests>=2.32.3
+tqdm>=4.66.4
+pillow>=10.4.0        # for thumbnails
+python-dateutil>=2.9.0.post0  # for time parsing
+pyperclip>=1.9.0      # clipboard detection
+pystray>=0.19.5       # system tray support (optional)
+rich>=13.7.1          # pretty console logs (optional)
+PyQt5>=5.15.11
+mutagen>=1.47.0       # for audio metadata editing
+gallery-dl>=1.27.6    # for gallery downloads
